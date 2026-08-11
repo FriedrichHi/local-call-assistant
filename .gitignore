@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local runtime data
+runtime/
+recordings/
+transcripts/
+*.db
+*.db-shm
+*.db-wal
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Build output
+build/
+dist/
+node_modules/
