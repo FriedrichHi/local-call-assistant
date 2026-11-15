@@ -20,3 +20,7 @@ transcripts/
 build/
 dist/
 node_modules/
+
+# Tooling caches
+.pytest_cache/
+*.egg-info/
