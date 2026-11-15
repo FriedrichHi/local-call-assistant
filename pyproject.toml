@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "local-call-assistant"
+version = "0.1.0"
+description = "Local-first, cross-platform call recording and transcription pipeline"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+transcription = ["faster-whisper>=1.2,<2"]
+
+[project.scripts]
+lca = "local_call_assistant.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
