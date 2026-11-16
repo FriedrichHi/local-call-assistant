@@ -1,6 +1,8 @@
+import importlib.metadata
 import os
-from pathlib import Path
-from types import SimpleNamespace
+import sys
+from pathlib import Path, PurePosixPath
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -8,59 +10,108 @@ from local_call_assistant import transcription
 from local_call_assistant.config import TranscriptionConfig
 from local_call_assistant.transcription import FasterWhisperBackend
 
+ORIGINAL_PATH = os.pathsep.join(["/existing", "/other"])
+
+
+class FakeDistribution:
+    def __init__(self, root: Path, files: list[str]) -> None:
+        self.root, self.files = root, [PurePosixPath(f) for f in files]
+
+    def locate_file(self, path: PurePosixPath) -> Path:
+        return self.root / path
+
+
+def _install(monkeypatch: pytest.MonkeyPatch, distribution: FakeDistribution | None) -> None:
+    def lookup(name: str) -> FakeDistribution:
+        if distribution is None or name != transcription.CUBLAS_DISTRIBUTION:
+            raise importlib.metadata.PackageNotFoundError(name)
+        return distribution
+    monkeypatch.setattr(transcription.importlib.metadata, "distribution", lookup)
+
 
 @pytest.fixture
-def nvidia_packages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    root = tmp_path / "site-packages" / "nvidia"
-    dirs = [root / "cublas" / "bin", root / "cudnn" / "bin"]
-    for directory in dirs:
-        directory.mkdir(parents=True)
-    (root / "cuda_runtime").mkdir()  # a package without a bin folder is ignored
-    monkeypatch.setattr(transcription.importlib.util, "find_spec",
-                        lambda name: SimpleNamespace(submodule_search_locations=[str(root)]))
-    monkeypatch.setenv("PATH", os.pathsep.join(["C:\\existing", "C:\\other"]))
-    return [str(d) for d in dirs]
+def cublas(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
+    root = tmp_path / "site-packages"
+    dll = root / transcription.CUBLAS_DLL
+    dll.parent.mkdir(parents=True)
+    dll.write_bytes(b"MZ")
+    planted = root / "nvidia" / "planted" / "bin" / "other.dll"  # listed first, never exposed
+    planted.parent.mkdir(parents=True)
+    planted.write_bytes(b"MZ")
+    _install(monkeypatch, FakeDistribution(
+        root, ["nvidia/planted/bin/other.dll", "nvidia/__init__.py", transcription.CUBLAS_DLL]))
+    monkeypatch.setenv("PATH", ORIGINAL_PATH)
+    monkeypatch.setattr(transcription, "_is_windows", lambda: True)
+    return str(dll.parent.resolve())
 
 
-def test_library_dirs_are_the_bin_folders(nvidia_packages: list[str]) -> None:
-    assert transcription.nvidia_library_dirs() == sorted(nvidia_packages)
+def test_only_the_recorded_cublas_folder_is_used(cublas: str) -> None:
+    assert transcription.cublas_dir() == cublas
 
 
-def test_no_nvidia_packages_means_no_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(transcription.importlib.util, "find_spec", lambda name: None)
-    assert transcription.nvidia_library_dirs() == []
+@pytest.mark.parametrize("files", [[], ["nvidia/cublas/bin/other.dll"]])
+def test_no_recorded_dll_means_nothing_is_exposed(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, files: list[str]) -> None:
+    _install(monkeypatch, FakeDistribution(tmp_path, files))
+    assert transcription.cublas_dir() is None
 
 
-def test_windows_appends_once_after_existing_entries(
-        nvidia_packages: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(transcription.os, "name", "nt")
-    transcription.expose_nvidia_libraries()
-    transcription.expose_nvidia_libraries()
-    assert os.environ["PATH"].split(os.pathsep) == ["C:\\existing", "C:\\other",
-                                                     *sorted(nvidia_packages)]
+def test_not_installed_means_nothing_is_exposed(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install(monkeypatch, None)
+    assert transcription.cublas_dir() is None
 
 
-def test_other_systems_leave_path_alone(
-        nvidia_packages: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(transcription.os, "name", "posix")
-    transcription.expose_nvidia_libraries()
-    assert os.environ["PATH"] == os.pathsep.join(["C:\\existing", "C:\\other"])
+def test_path_is_extended_only_during_the_attempt(cublas: str) -> None:
+    with transcription.nvidia_libraries_on_path():
+        assert os.environ["PATH"].split(os.pathsep) == ["/existing", "/other", cublas]
+    assert os.environ["PATH"] == ORIGINAL_PATH
 
 
-@pytest.mark.parametrize("device, exposed", [("cpu", False), ("cuda", True), ("auto", True)])
-def test_libraries_are_exposed_only_for_gpu_attempts(
-        monkeypatch: pytest.MonkeyPatch, device: str, exposed: bool) -> None:
-    calls: list[str] = []
-    monkeypatch.setattr(transcription, "expose_nvidia_libraries", lambda: calls.append("x"))
+def test_path_is_restored_when_the_attempt_fails(cublas: str) -> None:
+    with pytest.raises(RuntimeError):
+        with transcription.nvidia_libraries_on_path():
+            raise RuntimeError("CUDA failed")
+    assert os.environ["PATH"] == ORIGINAL_PATH
 
-    class FakeModel:
-        def __init__(self, *args, **kwargs) -> None:
-            pass
 
-        def transcribe(self, *args, **kwargs):
-            return [], SimpleNamespace(language="en", duration=0.0)
+def test_other_systems_leave_path_alone(cublas: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(transcription, "_is_windows", lambda: False)
+    with transcription.nvidia_libraries_on_path():
+        assert os.environ["PATH"] == ORIGINAL_PATH
 
-    import faster_whisper  # noqa: F401 - patched below; installed with the transcription extra
-    monkeypatch.setattr("faster_whisper.WhisperModel", FakeModel)
+
+@pytest.fixture
+def fake_whisper(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
+    """A stand-in faster_whisper module that records the device and PATH it saw."""
+    seen: list[tuple[str, str]] = []
+
+    class WhisperModel:
+        def __init__(self, model: str, device: str, compute_type: str) -> None:
+            self.device = device
+
+        def transcribe(self, source, **kwargs):
+            seen.append((self.device, os.environ["PATH"]))
+            if self.device == "cuda" and kwargs.get("language") == "fail-gpu":
+                raise RuntimeError("cuBLAS failed")
+            return iter([]), SimpleNamespace(language="en", duration=0.0)
+
+    module = ModuleType("faster_whisper")
+    module.WhisperModel = WhisperModel
+    monkeypatch.setitem(sys.modules, "faster_whisper", module)
+    return seen
+
+
+@pytest.mark.parametrize("device, gpu_path", [("cpu", False), ("cuda", True)])
+def test_only_gpu_attempts_see_the_folder(
+        cublas: str, fake_whisper: list, device: str, gpu_path: bool) -> None:
     FasterWhisperBackend(TranscriptionConfig(enabled=True, device=device)).transcribe(Path("x.wav"))
-    assert bool(calls) is exposed
+    assert (cublas in fake_whisper[0][1]) is gpu_path
+    assert os.environ["PATH"] == ORIGINAL_PATH
+
+
+def test_cpu_fallback_runs_without_the_folder(cublas: str, fake_whisper: list) -> None:
+    config = TranscriptionConfig(enabled=True, device="auto", language="fail-gpu")
+    FasterWhisperBackend(config).transcribe(Path("x.wav"))
+    assert [device for device, _ in fake_whisper] == ["cuda", "cpu"]
+    assert cublas in fake_whisper[0][1] and cublas not in fake_whisper[1][1]
+    assert os.environ["PATH"] == ORIGINAL_PATH  # later subprocesses (claude, ssh) see the original
