@@ -13,7 +13,8 @@ dependencies = []
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
-transcription = ["faster-whisper>=1.2,<2"]
+# av 19 removed the open() argument faster-whisper 1.2 passes (metadata_errors).
+transcription = ["faster-whisper>=1.2,<2", "av>=11,<19"]
 
 [project.scripts]
 lca = "local_call_assistant.cli:main"

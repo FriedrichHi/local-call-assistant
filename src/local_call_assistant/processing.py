@@ -132,8 +132,8 @@ class Pipeline:
         stage.status = StageStatus.RUNNING
         stage.attempts.append(Attempt(started_at=utc_now()))
         self.spool.save(manifest)  # persisted so a crash here is visible on recovery
-        audio_path = self.spool.path_of(manifest)
         try:
+            audio_path = self.spool.path_of(manifest)  # inside try: a bad path is a failed attempt
             _verify_audio(audio_path, manifest)
             stage.outputs = self.handlers[name](StageContext(self.spool, manifest, audio_path))
         except StageSkipped as skipped:

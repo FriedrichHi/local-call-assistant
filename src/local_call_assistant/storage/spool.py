@@ -18,11 +18,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
 import uuid
 import wave
 from collections.abc import Iterator
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import IO
 
 from local_call_assistant.models import (
@@ -34,6 +35,7 @@ from local_call_assistant.storage.filelock import JobLock
 SAMPLE_WIDTH_BYTES = 2
 FSYNC_INTERVAL_SECONDS = 1.0
 COPY_CHUNK_BYTES = 1024 * 1024
+AUDIO_NAME = re.compile(r"(?P<job>[0-9a-f]{32})\.[a-z0-9]{1,5}")
 
 
 class SpoolError(RuntimeError):
@@ -55,7 +57,32 @@ class RecordingSpool:
 
     # ----- paths -------------------------------------------------------
     def path_of(self, manifest: Manifest) -> Path:
-        return self.root / manifest.audio_file
+        """The job's audio file, which must be a plain file in recordings/completed.
+
+        A manifest edited or restored from elsewhere cannot point the pipeline
+        (and anything it sends) at a file outside the spool. This guards
+        against stale or foreign manifests, not against a process that can
+        write to the runtime folder while we run: such a process could equally
+        edit config.toml there (for example the homeserver host), so the
+        runtime folder must be writable only by its user.
+        """
+        # The name is the job ID plus an extension, so it can be no other job's
+        # file, no Windows device name and no NTFS alternate data stream.
+        parts = PurePosixPath(manifest.audio_file).parts
+        name = AUDIO_NAME.fullmatch(parts[-1]) if parts else None
+        if (len(parts) != 3 or parts[:2] != ("recordings", "completed")
+                or name is None or name.group("job") != manifest.job_id):
+            raise SpoolError(f"job {manifest.job_id}: audio file is not inside the spool")
+        path = self.completed / parts[2]
+        # Anchored to the resolved runtime root: the root itself may sit behind
+        # a junction, mapped drive or 8.3 name, but recordings/ and completed/
+        # below it must be real folders, and the file must not be a link.
+        expected = self.root.resolve(strict=False) / "recordings" / "completed"
+        actual = path.resolve(strict=False).parent
+        if (os.path.normcase(str(actual)) != os.path.normcase(str(expected))
+                or path.is_symlink()):
+            raise SpoolError(f"job {manifest.job_id}: audio file is not inside the spool")
+        return path
 
     def raw_path(self, job_id: str) -> Path:
         return self.pending / f"{job_id}.raw"

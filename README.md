@@ -11,6 +11,7 @@ The core guarantee is simple: **record locally first; process whenever possible*
   checksum, and a recording interrupted by a crash is recovered with its audio.
 - Ingest from an existing recorder's output folder, read-only and checksummed.
 - Optional local transcription with faster-whisper, GPU or CPU.
+- Optional transcription on a homeserver over SSH, as a secondary route.
 - Optional analysis through the Claude Code CLI (your Claude subscription) or
   a Hermes API server; off by default.
 - Draft notes written to an Obsidian inbox, never overwriting existing files.
@@ -29,7 +30,8 @@ lca status
 ```
 
 See [architecture](docs/architecture.md) for the configuration file, runtime
-folder and guarantees, and [transcription](docs/transcription.md) for GPU setup.
+folder and guarantees, [transcription](docs/transcription.md) for GPU setup,
+and [homeserver](docs/homeserver.md) for transcribing on another machine.
 
 ## Development
 
@@ -44,7 +46,8 @@ This project is intended for lawful, disclosed recording. Users are responsible
 for obtaining any required consent and complying with applicable law, contracts,
 workplace policy, and platform rules. Recordings, transcripts and notes stay on
 your machine unless you enable analysis, which sends transcript text (never
-audio) to the service you choose.
+audio) to the service you choose, or homeserver transcription, which sends the
+audio over SSH to a machine you configure.
 
 ## License
 

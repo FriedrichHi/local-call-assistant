@@ -21,6 +21,13 @@ CONFIG_FILE_NAME = "config.toml"
 HOME_ENV = "LCA_HOME"
 CONFIG_ENV = "LCA_CONFIG"
 MODEL_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._\[\]-]{0,99}")
+WHISPER_MODEL_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
+LANGUAGE_PATTERN = re.compile(r"[a-z]{2,3}")
+SSH_HOST_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@-]{0,252}")
+REMOTE_EXECUTABLE_PATTERN = re.compile(r"/[A-Za-z0-9_./+-]{1,500}")
+MAX_HOMESERVER_TIMEOUT_SECONDS = 24 * 3600
+COMPUTE_TYPES = frozenset({"default", "auto", "int8", "int8_float32", "int8_float16",
+                           "int8_bfloat16", "int16", "float16", "bfloat16", "float32"})
 
 
 @dataclass(frozen=True)
@@ -51,6 +58,16 @@ class ClaudeConfig:
 
 
 @dataclass(frozen=True)
+class HomeserverConfig:
+    """Transcribe on another machine over SSH instead of locally (off by default)."""
+    enabled: bool = False
+    host: str = ""             # an SSH host or alias from the user's ssh config
+    ssh_command: str = "ssh"   # one executable name or path, no arguments
+    remote_command: str = ""   # absolute path of lca on the server
+    timeout_seconds: float = 3600.0
+
+
+@dataclass(frozen=True)
 class ObsidianConfig:
     inbox: Path | None = None
 
@@ -63,6 +80,7 @@ class Config:
     transcription: TranscriptionConfig = field(default_factory=TranscriptionConfig)
     claude: ClaudeConfig = field(default_factory=ClaudeConfig)
     hermes: HermesConfig = field(default_factory=HermesConfig)
+    homeserver: HomeserverConfig = field(default_factory=HomeserverConfig)
     obsidian: ObsidianConfig = field(default_factory=ObsidianConfig)
 
 
@@ -85,12 +103,58 @@ def _claude_from(section: dict[str, Any]) -> ClaudeConfig:
     model = section.get("model")
     if model is not None and (not isinstance(model, str) or not MODEL_PATTERN.fullmatch(model)):
         raise ValueError("[claude] model must be a model name such as \"sonnet\"")
-    timeout = section.get("timeout_seconds", ClaudeConfig.timeout_seconds)
-    if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
-            or not math.isfinite(timeout) or timeout <= 0):
-        raise ValueError("[claude] timeout_seconds must be a positive number")
+    timeout = _positive_number(section.get("timeout_seconds", ClaudeConfig.timeout_seconds),
+                               "[claude] timeout_seconds")
     return ClaudeConfig(enabled=section.get("enabled", False), command=tuple(command),
-                        model=model, timeout_seconds=float(timeout))
+                        model=model, timeout_seconds=timeout)
+
+
+def _positive_number(value: Any, label: str) -> float:
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value) or value <= 0):
+        raise ValueError(f"{label} must be a positive number")
+    return float(value)
+
+
+def _homeserver_from(section: dict[str, Any], transcription: TranscriptionConfig) -> HomeserverConfig:
+    unknown = set(section) - {"enabled", "host", "ssh_command", "remote_command", "timeout_seconds"}
+    if unknown:
+        raise ValueError(f"unknown [homeserver] settings: {', '.join(sorted(unknown))}")
+    config = HomeserverConfig(
+        enabled=section.get("enabled", False), host=section.get("host", ""),
+        ssh_command=section.get("ssh_command", "ssh"),
+        remote_command=section.get("remote_command", ""),
+        timeout_seconds=_positive_number(section.get("timeout_seconds", 3600.0),
+                                         "[homeserver] timeout_seconds"))
+    if config.timeout_seconds > MAX_HOMESERVER_TIMEOUT_SECONDS:
+        raise ValueError("[homeserver] timeout_seconds must be at most one day")
+    if not config.enabled:
+        return config
+    if not isinstance(config.host, str) or not SSH_HOST_PATTERN.fullmatch(config.host):
+        raise ValueError("[homeserver] host must be an SSH host name or alias")
+    ssh = config.ssh_command
+    # One executable: a bare name, or an absolute path (which may contain spaces).
+    if (not isinstance(ssh, str) or not ssh or ssh.startswith("-")
+            or (any(c.isspace() for c in ssh) and not Path(ssh).is_absolute())):
+        raise ValueError("[homeserver] ssh_command must be one executable, without arguments")
+    remote = config.remote_command
+    if (not isinstance(remote, str) or not REMOTE_EXECUTABLE_PATTERN.fullmatch(remote)
+            or ".." in remote.split("/")):
+        raise ValueError("[homeserver] remote_command must be the absolute path of lca on the server")
+    if not transcription.enabled:
+        raise ValueError("[homeserver] needs [transcription] enabled = true")
+    _check_remote_transcription(transcription)
+    return config
+
+
+def _check_remote_transcription(transcription: TranscriptionConfig) -> None:
+    # The server accepts plain model names only: no local paths or repository IDs.
+    if not WHISPER_MODEL_PATTERN.fullmatch(str(transcription.model)):
+        raise ValueError("with [homeserver], [transcription] model must be a plain name such as \"small\"")
+    if transcription.language is not None and not LANGUAGE_PATTERN.fullmatch(str(transcription.language)):
+        raise ValueError("[transcription] language must be a code such as \"de\"")
+    if transcription.cpu_compute_type not in COMPUTE_TYPES:
+        raise ValueError("[transcription] cpu_compute_type is not a known compute type")
 
 
 def default_runtime_root() -> Path:
@@ -127,17 +191,20 @@ def _from_dict(root: Path, data: dict[str, Any]) -> Config:
     max_attempts = int(data.get("max_attempts", 3))
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least 1")
-    for section in ("transcription", "claude", "hermes"):
+    for section in ("transcription", "claude", "hermes", "homeserver"):
         _require_bool(data.get(section, {}), section)
     claude, hermes = _claude_from(data.get("claude", {})), HermesConfig(**data.get("hermes", {}))
     if claude.enabled and hermes.enabled:
         raise ValueError("enable either [claude] or [hermes] for analysis, not both")
+    transcription = TranscriptionConfig(**data.get("transcription", {}))
+    homeserver = _homeserver_from(data.get("homeserver", {}), transcription)
     return Config(
         runtime_root=root,
         max_attempts=max_attempts,
         ingest_min_age_seconds=float(data.get("ingest_min_age_seconds", 60.0)),
-        transcription=TranscriptionConfig(**data.get("transcription", {})),
+        transcription=transcription,
         claude=claude,
         hermes=hermes,
+        homeserver=homeserver,
         obsidian=ObsidianConfig(inbox=Path(inbox).expanduser() if inbox else None),
     )

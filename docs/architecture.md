@@ -3,7 +3,7 @@
 ```text
 capture (existing recorder, or RecordingSession)
   -> spool: audio file + manifest, checksummed, crash-safe
-  -> transcription (optional, faster-whisper, local)
+  -> transcription (optional, faster-whisper, local; or on the homeserver over SSH)
   -> analysis (optional, Claude CLI or Hermes, transcript text only)
   -> note (optional, Obsidian draft, never overwrites)
 ```
@@ -54,6 +54,13 @@ language = "de"        # omit to auto-detect
 [obsidian]
 inbox = "C:/path/to/vault/Inbox"
 
+[homeserver]           # optional: transcribe on another machine over SSH instead
+enabled = false
+host = "homeserver"    # an SSH host or alias from your ssh config (key login)
+remote_command = "/home/you/local-call-assistant/.venv/bin/lca"
+# ssh_command = "ssh"  # one executable; an absolute path may contain spaces
+timeout_seconds = 3600
+
 # Analysis: enable at most one of [claude] and [hermes]. Both are off by default.
 [claude]               # the Claude Code CLI, signed in with a Claude subscription
 enabled = false
@@ -69,8 +76,9 @@ api_key_env = "LCA_HERMES_API_KEY"
 
 ## Privacy
 
-Recording, transcription and note writing run entirely on this machine. Audio
-never leaves it. Enabling analysis sends transcript text only:
+Recording, transcription and note writing run on this machine by default, and
+audio never leaves it unless `[homeserver]` is enabled. Enabling analysis
+sends transcript text only:
 
 - **`[claude]`** runs `claude -p` locally, which sends the transcript to
   Anthropic under the signed-in Claude account. The call is isolated: no
@@ -89,10 +97,17 @@ never leaves it. Enabling analysis sends transcript text only:
   address, redirects are refused, and system proxy settings are ignored. The
   API key is read from the named environment variable, never the config file.
 
+- **`[homeserver]`** sends the recording's audio over SSH to the configured
+  host for transcription. See [homeserver](homeserver.md).
+
 Error messages stored in manifests are fixed texts and never quote the
 service's output.
+
+Every stage reads only audio inside the spool: a manifest whose audio file is
+not `recordings/completed/<job id>.<extension>` (a plain file, not a link) is
+refused before anything reads or sends it.
 
 ## Not built yet
 
 Own WASAPI capture (fallback if no existing recorder passes phase 0), a tray
-interface, the homeserver worker (OPS-59) and Linux/macOS capture (OPS-60).
+interface and Linux/macOS capture (OPS-60).
