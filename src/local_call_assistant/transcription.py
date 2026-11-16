@@ -56,7 +56,10 @@ class FasterWhisperBackend:
         try:
             return self._run(audio_path, "cuda", self.config.compute_type)
         except (RuntimeError, OSError, ValueError):
-            # CUDA unavailable or its libraries missing: use the CPU profile.
+            # CUDA unavailable or its libraries missing: use the CPU profile,
+            # from the start of the audio if it is a file object.
+            if not isinstance(audio_path, Path):
+                audio_path.seek(0)
             return self._run(audio_path, "cpu", self.config.cpu_compute_type)
 
     def _run(self, audio: Path | BinaryIO, device: str, compute_type: str) -> Transcript:

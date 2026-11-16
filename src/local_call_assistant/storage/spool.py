@@ -70,9 +70,12 @@ class RecordingSpool:
                 or name is None or name.group("job") != manifest.job_id):
             raise SpoolError(f"job {manifest.job_id}: audio file is not inside the spool")
         path = self.completed / parts[2]
-        # Both sides resolved, so junctions, mapped drives or 8.3 names on the
-        # runtime root do not cause false rejections.
-        if (path.resolve(strict=False).parent != self.completed.resolve(strict=False)
+        # Anchored to the resolved runtime root: the root itself may sit behind
+        # a junction, mapped drive or 8.3 name, but recordings/ and completed/
+        # below it must be real folders, and the file must not be a link.
+        expected = self.root.resolve(strict=False) / "recordings" / "completed"
+        actual = path.resolve(strict=False).parent
+        if (os.path.normcase(str(actual)) != os.path.normcase(str(expected))
                 or path.is_symlink()):
             raise SpoolError(f"job {manifest.job_id}: audio file is not inside the spool")
         return path

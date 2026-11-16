@@ -28,6 +28,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -48,6 +49,7 @@ SSH_SAFETY_OPTIONS = (
 )
 BATCH_SUFFIXES = (".cmd", ".bat")
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+POLL_SECONDS = 0.2
 SERVER_DEADLINE_MARGIN_SECONDS = 60.0
 HASH_CHUNK_BYTES = 1024 * 1024
 SSH_CONNECTION_FAILED = 255
@@ -132,26 +134,39 @@ def _sha256_of(handle: BinaryIO) -> str:
 
 
 def _run(command: list[str], audio: BinaryIO, timeout: float) -> tuple[int, bytes]:
-    # stdout goes to a temporary file rather than memory, and is size-checked
-    # before it is read; no pipes, so the timeout always holds.
+    # stdout goes to a temporary file rather than memory; no pipes, so the
+    # timeout always holds. Its size is watched while ssh runs, so a server
+    # that keeps writing is stopped instead of filling the disk.
     with tempfile.TemporaryFile(prefix="lca-homeserver-") as output:
         try:
-            completed = subprocess.run(command, stdin=audio, stdout=output,
-                                       stderr=subprocess.DEVNULL, timeout=timeout, check=False)
-        except subprocess.TimeoutExpired:
-            raise HomeserverError("the homeserver did not finish within the timeout") from None
+            process = subprocess.Popen(command, stdin=audio, stdout=output,
+                                       stderr=subprocess.DEVNULL)
         except OSError:
             raise HomeserverError("ssh could not be started") from None
-        if output.seek(0, 2) > MAX_RESPONSE_BYTES:
-            raise HomeserverError("the homeserver response was too large")
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                code = process.wait(timeout=POLL_SECONDS)
+            except subprocess.TimeoutExpired:
+                code = None
+            too_large = os.fstat(output.fileno()).st_size > MAX_RESPONSE_BYTES
+            if code is not None and not too_large:
+                break
+            if too_large or time.monotonic() >= deadline:
+                process.kill()
+                process.wait()
+                raise HomeserverError("the homeserver response was too large" if too_large
+                                      else "the homeserver did not finish within the timeout")
         output.seek(0)
-        return completed.returncode, output.read()
+        return code, output.read()
 
 
 def _parse(output: bytes, sha256: str) -> Transcript:
     try:
         document = json.loads(output.decode("utf-8"))
-        if (not isinstance(document, dict) or document.get("protocol") != server.PROTOCOL
+        protocol = document.get("protocol") if isinstance(document, dict) else None
+        # type() check: JSON true and 1.0 must not pass as protocol version 1.
+        if (type(protocol) is not int or protocol != server.PROTOCOL
                 or document.get("sha256") != sha256):
             raise ValueError("unexpected envelope")
         return transcript_from_dict(document.get("transcript"))

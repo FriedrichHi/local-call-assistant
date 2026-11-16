@@ -2,6 +2,7 @@ import argparse
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -19,7 +20,9 @@ from local_call_assistant.integrations.homeserver import (
 from local_call_assistant.models import Manifest, StageStatus
 from local_call_assistant.processing import Pipeline
 from local_call_assistant.storage.spool import RecordingSpool, sha256_of
-from local_call_assistant.transcription import Segment, Transcript, transcription_handler
+from local_call_assistant.transcription import (
+    FasterWhisperBackend, Segment, Transcript, transcription_handler,
+)
 
 FAKE_SSH = str(Path(__file__).with_name("fake_ssh.py"))
 SECRET = "server-secret-quote"
@@ -142,6 +145,92 @@ def test_oversized_response_is_rejected(
         transcribe_remote(_config(), TRANSCRIPTION, spool.path_of(recorded), recorded.sha256, _resolve)
 
 
+def test_a_server_that_keeps_writing_is_stopped_early(
+        recorded: Manifest, spool: RecordingSpool, fake_ssh: Path,
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(homeserver, "MAX_RESPONSE_BYTES", 1024 * 1024)
+    monkeypatch.setenv("FAKE_SSH_MODE", "stream")
+    outcome: list[BaseException] = []
+
+    def call() -> None:
+        try:
+            transcribe_remote(_config(timeout_seconds=600.0), TRANSCRIPTION,
+                              spool.path_of(recorded), recorded.sha256, _resolve)
+        except BaseException as error:  # noqa: BLE001 - handed to the main thread
+            outcome.append(error)
+
+    worker = threading.Thread(target=call, daemon=True)
+    worker.start()
+    worker.join(WATCHDOG_SECONDS)  # long before the 600 s timeout
+    assert not worker.is_alive(), "a server that keeps writing was not stopped"
+    assert isinstance(outcome[0], HomeserverError) and "too large" in str(outcome[0])
+
+
+def _envelope(**changes: object) -> bytes:
+    document = {"protocol": 1, "sha256": "a" * 64, "transcript": {
+        "language": "de", "duration": 2.0, "model": "small", "device": "cpu",
+        "compute_type": "int8", "segments": [{"start": 0.0, "end": 2.0, "text": " Hallo"}]}}
+    segment_changes = changes.pop("segment", {})
+    document["transcript"]["segments"][0].update(segment_changes)
+    document.update(changes)
+    return json.dumps(document).encode("utf-8")
+
+
+def test_a_valid_response_parses() -> None:
+    assert homeserver._parse(_envelope(), "a" * 64).segments == [Segment(0.0, 2.0, " Hallo")]
+
+
+@pytest.mark.parametrize("changes", [
+    {"protocol": True}, {"protocol": 1.0}, {"protocol": "1"}, {"protocol": 2},
+    {"segment": {"start": True}}, {"segment": {"end": float("nan")}},
+    {"segment": {"start": -1.0}}, {"segment": {"start": 3.0}}, {"segment": {"text": 5}},
+    {"transcript": []}, {"transcript": {"segments": "x"}},
+])
+def test_malformed_responses_are_rejected(changes: dict) -> None:
+    with pytest.raises(HomeserverError, match="not a valid transcript"):
+        homeserver._parse(_envelope(**changes), "a" * 64)
+
+
+def test_cpu_retry_starts_from_the_beginning_of_the_audio(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = FasterWhisperBackend(TranscriptionConfig(enabled=True, device="auto"))
+    reads: list[bytes] = []
+
+    def run(audio, device, compute_type):
+        reads.append(audio.read())
+        if device == "cuda":
+            raise RuntimeError("cuBLAS missing")
+        return Transcript(None, None, [], "small", device, compute_type)
+
+    monkeypatch.setattr(backend, "_run", run)
+    backend.transcribe(io.BytesIO(b"audio"))
+    assert reads == [b"audio", b"audio"]
+
+
+def _redirect_directory(directory: Path, target: Path) -> None:
+    """Replace a folder with a link to another one (a junction on Windows)."""
+    shutil.copytree(directory, target)
+    shutil.rmtree(directory)
+    try:
+        directory.symlink_to(target, target_is_directory=True)
+    except OSError:
+        if os.name != "nt":
+            raise
+        subprocess.run(["cmd", "/c", "mklink", "/J", str(directory), str(target)],
+                       check=True, capture_output=True)
+
+
+@pytest.mark.parametrize("redirected", ["recordings", "recordings/completed"])
+def test_redirected_spool_folders_are_refused(
+        spool: RecordingSpool, recorded: Manifest, fake_ssh: Path, tmp_path: Path,
+        redirected: str) -> None:
+    _redirect_directory(spool.root / redirected, tmp_path / "elsewhere")
+    manifest = _pipeline(spool).process(recorded.job_id)
+    stage = manifest.stage("transcription")
+    assert stage.status is StageStatus.FAILED and "not inside the spool" in stage.attempts[-1].error
+    assert len(stage.attempts) == 1  # an ordinary failed attempt, retryable within the budget
+    assert not fake_ssh.exists()
+
+
 def test_timeout_holds_when_ssh_never_reads(
         spool: RecordingSpool, fake_ssh: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     manifest = spool.start(sample_rate=16_000, channels=1)
@@ -173,12 +262,15 @@ def test_timeout_holds_when_ssh_never_reads(
 def test_only_spooled_audio_can_be_sent(
         spool: RecordingSpool, recorded: Manifest, fake_ssh: Path, audio_file: str) -> None:
     audio_file = audio_file.format(job=recorded.job_id)
+    original = spool.path_of(recorded)
     tampered = Manifest.from_dict({**recorded.to_dict(), "audio_file": audio_file})
     spool.save(tampered)
     manifest = _pipeline(spool).process(recorded.job_id)
     stage = manifest.stage("transcription")
     assert stage.status is StageStatus.FAILED and "not inside the spool" in stage.attempts[-1].error
+    assert len(stage.attempts) == 1  # an ordinary failed attempt, retryable within the budget
     assert not fake_ssh.exists()  # ssh was never started
+    assert sha256_of(original) == recorded.sha256
 
 
 def test_symlinked_audio_is_refused(

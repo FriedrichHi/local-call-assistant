@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 SECRET_OUTPUT = "server-secret-quote"
+STREAM_SECONDS = 40  # longer than the test watchdog; at most ~250 MB at this rate
 
 mode = os.environ.get("FAKE_SSH_MODE", "serve")
 if mode == "never-reads":
@@ -36,6 +37,15 @@ if mode == "garbage":
 if mode.startswith("exit:"):
     print(SECRET_OUTPUT, file=sys.stderr)
     sys.exit(int(mode.split(":")[1]))
+if mode == "stream":  # a broken server that keeps writing
+    # Slow and time-bounded: it passes any test limit within a second, outlasts
+    # the test's watchdog, and cannot leave an endless writer behind.
+    deadline = time.monotonic() + STREAM_SECONDS
+    while time.monotonic() < deadline:
+        sys.stdout.buffer.write(b" " * 65536)
+        sys.stdout.buffer.flush()
+        time.sleep(0.01)
+    sys.exit(0)
 if mode == "huge":
     sys.stdout.buffer.write(b" " * (int(os.environ["FAKE_SSH_HUGE_BYTES"])))
     sys.exit(0)
