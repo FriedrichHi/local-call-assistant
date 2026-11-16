@@ -166,6 +166,27 @@ def test_a_server_that_keeps_writing_is_stopped_early(
     assert isinstance(outcome[0], HomeserverError) and "too large" in str(outcome[0])
 
 
+def test_ssh_is_stopped_when_monitoring_fails(
+        recorded: Manifest, spool: RecordingSpool, fake_ssh: Path,
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FAKE_SSH_MODE", "never-reads")
+    started: list[subprocess.Popen] = []
+    real_popen = subprocess.Popen
+
+    def popen(*args, **kwargs):
+        started.append(real_popen(*args, **kwargs))
+        return started[-1]
+
+    def interrupted() -> float:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(homeserver.subprocess, "Popen", popen)
+    monkeypatch.setattr(homeserver.time, "monotonic", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        transcribe_remote(_config(), TRANSCRIPTION, spool.path_of(recorded), recorded.sha256, _resolve)
+    assert started and started[0].poll() is not None  # killed and reaped, not left running
+
+
 def _envelope(**changes: object) -> bytes:
     document = {"protocol": 1, "sha256": "a" * 64, "transcript": {
         "language": "de", "duration": 2.0, "model": "small", "device": "cpu",
@@ -229,6 +250,8 @@ def test_redirected_spool_folders_are_refused(
     assert stage.status is StageStatus.FAILED and "not inside the spool" in stage.attempts[-1].error
     assert len(stage.attempts) == 1  # an ordinary failed attempt, retryable within the budget
     assert not fake_ssh.exists()
+    moved = next((tmp_path / "elsewhere").rglob(f"{recorded.job_id}.wav"))
+    assert sha256_of(moved) == recorded.sha256  # the audio itself is untouched
 
 
 def test_timeout_holds_when_ssh_never_reads(

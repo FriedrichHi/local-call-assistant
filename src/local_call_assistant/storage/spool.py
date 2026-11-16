@@ -60,7 +60,11 @@ class RecordingSpool:
         """The job's audio file, which must be a plain file in recordings/completed.
 
         A manifest edited or restored from elsewhere cannot point the pipeline
-        (and anything it sends) at a file outside the spool.
+        (and anything it sends) at a file outside the spool. This guards
+        against stale or foreign manifests, not against a process that can
+        write to the runtime folder while we run: such a process could equally
+        edit config.toml there (for example the homeserver host), so the
+        runtime folder must be writable only by its user.
         """
         # The name is the job ID plus an extension, so it can be no other job's
         # file, no Windows device name and no NTFS alternate data stream.

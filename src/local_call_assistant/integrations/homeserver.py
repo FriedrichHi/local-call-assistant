@@ -143,22 +143,30 @@ def _run(command: list[str], audio: BinaryIO, timeout: float) -> tuple[int, byte
                                        stderr=subprocess.DEVNULL)
         except OSError:
             raise HomeserverError("ssh could not be started") from None
-        deadline = time.monotonic() + timeout
-        while True:
-            try:
-                code = process.wait(timeout=POLL_SECONDS)
-            except subprocess.TimeoutExpired:
-                code = None
-            too_large = os.fstat(output.fileno()).st_size > MAX_RESPONSE_BYTES
-            if code is not None and not too_large:
-                break
-            if too_large or time.monotonic() >= deadline:
+        try:
+            code = _monitor(process, output, timeout)
+        finally:
+            if process.poll() is None:  # any early exit, Ctrl+C included: never leave ssh running
                 process.kill()
                 process.wait()
-                raise HomeserverError("the homeserver response was too large" if too_large
-                                      else "the homeserver did not finish within the timeout")
         output.seek(0)
         return code, output.read()
+
+
+def _monitor(process: subprocess.Popen, output: BinaryIO, timeout: float) -> int:
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            code = process.wait(timeout=POLL_SECONDS)
+        except subprocess.TimeoutExpired:
+            code = None
+        too_large = os.fstat(output.fileno()).st_size > MAX_RESPONSE_BYTES
+        if too_large:
+            raise HomeserverError("the homeserver response was too large")
+        if code is not None:
+            return code
+        if time.monotonic() >= deadline:
+            raise HomeserverError("the homeserver did not finish within the timeout")
 
 
 def _parse(output: bytes, sha256: str) -> Transcript:
