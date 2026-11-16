@@ -4,12 +4,22 @@ faster-whisper is an optional dependency (``pip install .[transcription]``);
 recording, ingest and replay never import it. With ``device = "auto"`` the
 backend tries CUDA and falls back to the CPU configuration if CUDA cannot be
 used (no GPU, or the CUDA runtime libraries are missing).
+
+On Windows, NVIDIA's runtime libraries can come from pip (``.[gpu]``). They
+install into site-packages/nvidia/cublas/bin, which Windows does not search,
+and CTranslate2 loads them by name, so that folder is appended to this
+process's PATH for the duration of each GPU attempt and removed again
+afterwards. Nothing outside the attempt sees it.
 """
 
 from __future__ import annotations
 
+import importlib.metadata
 import json
 import math
+import os
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, Protocol
@@ -19,6 +29,8 @@ from local_call_assistant.processing import StageContext, StageSkipped
 from local_call_assistant.storage.atomic import atomic_write_text
 
 TRANSCRIPTS_DIR = "transcripts"
+CUBLAS_DISTRIBUTION = "nvidia-cublas-cu12"
+CUBLAS_DLL = "nvidia/cublas/bin/cublas64_12.dll"
 
 
 @dataclass(frozen=True)
@@ -65,13 +77,59 @@ class FasterWhisperBackend:
     def _run(self, audio: Path | BinaryIO, device: str, compute_type: str) -> Transcript:
         from faster_whisper import WhisperModel  # optional dependency
 
-        model = WhisperModel(self.config.model, device=device, compute_type=compute_type)
-        source = str(audio) if isinstance(audio, Path) else audio
-        segments, info = model.transcribe(source, language=self.config.language,
-                                          vad_filter=True)
-        collected = [Segment(s.start, s.end, s.text) for s in segments]
+        libraries = nullcontext() if device == "cpu" else nvidia_libraries_on_path()
+        with libraries:  # covers model creation and decoding, where CUDA loads cuBLAS
+            model = WhisperModel(self.config.model, device=device, compute_type=compute_type)
+            source = str(audio) if isinstance(audio, Path) else audio
+            segments, info = model.transcribe(source, language=self.config.language,
+                                              vad_filter=True)
+            collected = [Segment(s.start, s.end, s.text) for s in segments]
         return Transcript(language=info.language, duration=info.duration, segments=collected,
                           model=self.config.model, device=device, compute_type=compute_type)
+
+
+def cublas_dir() -> str | None:
+    """The folder holding cublas64_12.dll, taken from the installed package's record.
+
+    Only the nvidia-cublas-cu12 distribution's own listed DLL counts, so no
+    other folder that merely looks like an NVIDIA package can be added.
+    """
+    try:
+        distribution = importlib.metadata.distribution(CUBLAS_DISTRIBUTION)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+    for listed in distribution.files or []:
+        if listed.as_posix() == CUBLAS_DLL:
+            dll = Path(distribution.locate_file(listed)).resolve()
+            return str(dll.parent) if dll.is_file() else None
+    return None
+
+
+@contextmanager
+def nvidia_libraries_on_path() -> Iterator[None]:
+    """Make cuBLAS findable for the duration of one GPU attempt, then restore PATH.
+
+    Windows only. Appended, not prepended, so an existing CUDA installation
+    keeps priority; restored afterwards, so later subprocesses (the Claude
+    CLI, ssh) never see the extra folder.
+    """
+    directory = cublas_dir() if _is_windows() else None
+    original = os.environ.get("PATH")
+    if directory is None or directory in (original or "").split(os.pathsep):
+        yield
+        return
+    os.environ["PATH"] = os.pathsep.join(filter(None, [original, directory]))
+    try:
+        yield
+    finally:
+        if original is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = original
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
 
 
 def transcription_handler(config: TranscriptionConfig,
