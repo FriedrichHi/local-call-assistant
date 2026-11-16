@@ -1,4 +1,8 @@
-"""Command line: ``lca status | recover | ingest | ingest-dir | process | retry``."""
+"""Command line: ``lca status | recover | ingest | ingest-dir | process | retry``.
+
+``lca transcribe-stdin`` is the server side of homeserver transcription; it
+reads no configuration (see integrations/homeserver_server).
+"""
 
 from __future__ import annotations
 
@@ -10,7 +14,9 @@ from pathlib import Path
 
 from local_call_assistant.config import Config, config_path, load_config
 from local_call_assistant.integrations.claude_cli import claude_handler
+from local_call_assistant.integrations import homeserver_server
 from local_call_assistant.integrations.hermes import analysis_handler
+from local_call_assistant.integrations.homeserver import homeserver_handler
 from local_call_assistant.integrations.obsidian import note_handler
 from local_call_assistant.models import PROCESSABLE_STATUSES
 from local_call_assistant.processing import STAGE_ORDER, Pipeline
@@ -22,8 +28,10 @@ from local_call_assistant.transcription import transcription_handler
 def build_pipeline(config: Config) -> Pipeline:
     analysis = (claude_handler(config.claude) if config.claude.enabled
                 else analysis_handler(config.hermes))  # each skips when disabled
+    transcription = (homeserver_handler(config.transcription, config.homeserver)
+                     if config.homeserver.enabled else transcription_handler(config.transcription))
     handlers = {
-        "transcription": transcription_handler(config.transcription),
+        "transcription": transcription,
         "analysis": analysis,
         "note": note_handler(config.obsidian),
     }
@@ -111,15 +119,21 @@ def parser() -> argparse.ArgumentParser:
     retry = sub.add_parser("retry", help="reset a failed or skipped stage")
     retry.add_argument("job")
     retry.add_argument("--stage", choices=STAGE_ORDER, default="transcription")
+    serve = sub.add_parser(SERVER_COMMAND,
+                           help="server side of homeserver transcription (run over SSH)")
+    homeserver_server.add_arguments(serve)
     return root
 
 
+SERVER_COMMAND = "transcribe-stdin"
 COMMANDS = {"status": cmd_status, "recover": cmd_recover, "ingest": cmd_ingest,
             "ingest-dir": cmd_ingest, "process": cmd_process, "retry": cmd_retry}
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    if args.command == SERVER_COMMAND:  # before any configuration is read
+        return homeserver_server.run(args)
     config = load_config(Path(args.home) if args.home else None)
     try:
         return COMMANDS[args.command](config, args)
