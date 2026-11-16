@@ -4,12 +4,20 @@ faster-whisper is an optional dependency (``pip install .[transcription]``);
 recording, ingest and replay never import it. With ``device = "auto"`` the
 backend tries CUDA and falls back to the CPU configuration if CUDA cannot be
 used (no GPU, or the CUDA runtime libraries are missing).
+
+On Windows, NVIDIA's runtime libraries can come from pip (``.[gpu]``). They
+install into site-packages/nvidia/*/bin, which Windows does not search, and
+CTranslate2 loads them by name, so those folders are appended to this
+process's PATH before the model is created. Nothing outside the process
+changes.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, Protocol
@@ -65,6 +73,8 @@ class FasterWhisperBackend:
     def _run(self, audio: Path | BinaryIO, device: str, compute_type: str) -> Transcript:
         from faster_whisper import WhisperModel  # optional dependency
 
+        if device != "cpu":
+            expose_nvidia_libraries()
         model = WhisperModel(self.config.model, device=device, compute_type=compute_type)
         source = str(audio) if isinstance(audio, Path) else audio
         segments, info = model.transcribe(source, language=self.config.language,
@@ -72,6 +82,25 @@ class FasterWhisperBackend:
         collected = [Segment(s.start, s.end, s.text) for s in segments]
         return Transcript(language=info.language, duration=info.duration, segments=collected,
                           model=self.config.model, device=device, compute_type=compute_type)
+
+
+def nvidia_library_dirs() -> list[str]:
+    """The bin folders of NVIDIA's pip packages (Windows wheels keep DLLs there)."""
+    spec = importlib.util.find_spec("nvidia")
+    if spec is None or not spec.submodule_search_locations:
+        return []
+    return sorted(str(path) for root in spec.submodule_search_locations
+                  for path in Path(root).glob("*/bin") if path.is_dir())
+
+
+def expose_nvidia_libraries() -> None:
+    if os.name != "nt":
+        return  # Linux wheels need the loader path set before the process starts
+    current = os.environ.get("PATH", "").split(os.pathsep)
+    missing = [d for d in nvidia_library_dirs() if d not in current]
+    if missing:
+        # Appended, not prepended: an existing CUDA installation keeps priority.
+        os.environ["PATH"] = os.pathsep.join([*current, *missing])
 
 
 def transcription_handler(config: TranscriptionConfig,
