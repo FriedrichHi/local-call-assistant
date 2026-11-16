@@ -4,7 +4,7 @@
 capture (existing recorder, or RecordingSession)
   -> spool: audio file + manifest, checksummed, crash-safe
   -> transcription (optional, faster-whisper, local)
-  -> analysis (optional, Hermes, sends transcript text only)
+  -> analysis (optional, Claude CLI or Hermes, transcript text only)
   -> note (optional, Obsidian draft, never overwrites)
 ```
 
@@ -54,7 +54,14 @@ language = "de"        # omit to auto-detect
 [obsidian]
 inbox = "C:/path/to/vault/Inbox"
 
-[hermes]               # off by default; see the privacy note below
+# Analysis: enable at most one of [claude] and [hermes]. Both are off by default.
+[claude]               # the Claude Code CLI, signed in with a Claude subscription
+enabled = false
+command = ["claude"]
+# model = "sonnet"     # omit to use the CLI's default model
+timeout_seconds = 600
+
+[hermes]               # alternative: a Hermes API server
 enabled = false
 base_url = "http://127.0.0.1:8642"
 api_key_env = "LCA_HERMES_API_KEY"
@@ -62,12 +69,28 @@ api_key_env = "LCA_HERMES_API_KEY"
 
 ## Privacy
 
-Recording, transcription and note writing run entirely on this machine.
-Enabling `[hermes]` sends transcript text (never audio) to the Hermes API
-server, and from there to whichever model provider Hermes uses. Plain HTTP is
-refused except to a loopback address, redirects are refused, and system proxy
-settings are ignored so the request goes directly to Hermes. The API key is read from the named
-environment variable and never stored in the config file.
+Recording, transcription and note writing run entirely on this machine. Audio
+never leaves it. Enabling analysis sends transcript text only:
+
+- **`[claude]`** runs `claude -p` locally, which sends the transcript to
+  Anthropic under the signed-in Claude account. The call is isolated: no
+  tools, no MCP servers, no user or project settings (so no hooks or plugins
+  that could copy the transcript elsewhere), no saved session, and an empty
+  temporary working directory. It gets only an allowlist of basic operating
+  system variables, so nothing inherited can switch it to API billing or
+  another provider, change its endpoint, add headers, route it through a proxy
+  or load plugins. The native executable is run directly (npm's `claude.cmd`
+  is resolved to the `claude.exe` it wraps; other `.cmd`/`.bat` launchers are
+  refused), and the transcript goes in on standard input, never on the command
+  line, from a temporary file that is deleted when the call ends.
+  `command` may not contain options, and `model` must be a plain name.
+- **`[hermes]`** sends it to the Hermes API server and from there to whichever
+  model provider Hermes uses. Plain HTTP is refused except to a loopback
+  address, redirects are refused, and system proxy settings are ignored. The
+  API key is read from the named environment variable, never the config file.
+
+Error messages stored in manifests are fixed texts and never quote the
+service's output.
 
 ## Not built yet
 

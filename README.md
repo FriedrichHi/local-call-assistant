@@ -11,7 +11,8 @@ The core guarantee is simple: **record locally first; process whenever possible*
   checksum, and a recording interrupted by a crash is recovered with its audio.
 - Ingest from an existing recorder's output folder, read-only and checksummed.
 - Optional local transcription with faster-whisper, GPU or CPU.
-- Optional analysis through a Hermes API server (off by default).
+- Optional analysis through the Claude Code CLI (your Claude subscription) or
+  a Hermes API server; off by default.
 - Draft notes written to an Obsidian inbox, never overwriting existing files.
 - Retry and recovery state visible per recording.
 
@@ -42,7 +43,8 @@ pytest
 This project is intended for lawful, disclosed recording. Users are responsible
 for obtaining any required consent and complying with applicable law, contracts,
 workplace policy, and platform rules. Recordings, transcripts and notes stay on
-your machine unless you enable the Hermes integration.
+your machine unless you enable analysis, which sends transcript text (never
+audio) to the service you choose.
 
 ## License
 
