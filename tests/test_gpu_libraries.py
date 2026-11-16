@@ -88,12 +88,15 @@ def fake_whisper(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
     class WhisperModel:
         def __init__(self, model: str, device: str, compute_type: str) -> None:
             self.device = device
+            seen.append((f"{device}:load", os.environ["PATH"]))
 
         def transcribe(self, source, **kwargs):
-            seen.append((self.device, os.environ["PATH"]))
-            if self.device == "cuda" and kwargs.get("language") == "fail-gpu":
-                raise RuntimeError("cuBLAS failed")
-            return iter([]), SimpleNamespace(language="en", duration=0.0)
+            def segments():  # decoding is lazy: CUDA work happens while iterating
+                seen.append((f"{self.device}:decode", os.environ["PATH"]))
+                if self.device == "cuda" and kwargs.get("language") == "fail-gpu":
+                    raise RuntimeError("cuBLAS failed")
+                yield SimpleNamespace(start=0.0, end=1.0, text=" hi")
+            return segments(), SimpleNamespace(language="en", duration=1.0)
 
     module = ModuleType("faster_whisper")
     module.WhisperModel = WhisperModel
@@ -104,14 +107,16 @@ def fake_whisper(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
 @pytest.mark.parametrize("device, gpu_path", [("cpu", False), ("cuda", True)])
 def test_only_gpu_attempts_see_the_folder(
         cublas: str, fake_whisper: list, device: str, gpu_path: bool) -> None:
-    FasterWhisperBackend(TranscriptionConfig(enabled=True, device=device)).transcribe(Path("x.wav"))
-    assert (cublas in fake_whisper[0][1]) is gpu_path
+    result = FasterWhisperBackend(TranscriptionConfig(enabled=True, device=device)).transcribe(Path("x.wav"))
+    assert [step for step, _ in fake_whisper] == [f"{device}:load", f"{device}:decode"]
+    assert all((cublas in path) is gpu_path for _, path in fake_whisper)  # load and decode
+    assert result.text == "hi"
     assert os.environ["PATH"] == ORIGINAL_PATH
 
 
 def test_cpu_fallback_runs_without_the_folder(cublas: str, fake_whisper: list) -> None:
     config = TranscriptionConfig(enabled=True, device="auto", language="fail-gpu")
-    FasterWhisperBackend(config).transcribe(Path("x.wav"))
-    assert [device for device, _ in fake_whisper] == ["cuda", "cpu"]
-    assert cublas in fake_whisper[0][1] and cublas not in fake_whisper[1][1]
+    FasterWhisperBackend(config).transcribe(Path("x.wav"))  # CUDA fails while decoding
+    assert [step for step, _ in fake_whisper] == ["cuda:load", "cuda:decode", "cpu:load", "cpu:decode"]
+    assert [cublas in path for _, path in fake_whisper] == [True, True, False, False]
     assert os.environ["PATH"] == ORIGINAL_PATH  # later subprocesses (claude, ssh) see the original
