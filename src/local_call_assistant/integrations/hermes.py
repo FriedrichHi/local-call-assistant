@@ -18,19 +18,14 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from local_call_assistant.config import HermesConfig
+from local_call_assistant.integrations.analysis import (
+    SYSTEM_PROMPT, transcript_text, user_message, write_analysis,
+)
 from local_call_assistant.processing import StageContext, StageSkipped
-from local_call_assistant.storage.atomic import atomic_write_text
-from local_call_assistant.transcription import load_segments
 
-PAYLOAD_VERSION = 1
-ANALYSIS_DIR = "analysis"
+PROVIDER = "hermes"
 COMPLETIONS_PATH = "/v1/chat/completions"
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
-SYSTEM_PROMPT = (
-    "You analyse a call transcript for a draft note. Reply in Markdown with the sections "
-    "'Summary', 'Decisions', 'Action items', and 'Open questions'. Use only what the "
-    "transcript says; write 'None' for an empty section. Do not take any other action."
-)
 
 
 class HermesError(RuntimeError):
@@ -47,24 +42,23 @@ def check_endpoint(base_url: str) -> str:
     raise HermesError("Hermes base_url must use https (plain http only to localhost)")
 
 
-def build_payload(config: HermesConfig, job_id: str, transcript_text: str) -> dict[str, Any]:
+def build_payload(config: HermesConfig, job_id: str, text: str) -> dict[str, Any]:
     return {
         "model": config.model,
         "stream": False,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"Transcript (payload v{PAYLOAD_VERSION}, "
-                                        f"job {job_id}):\n\n{transcript_text}"},
+            {"role": "user", "content": user_message(job_id, text)},
         ],
     }
 
 
-def analyse(config: HermesConfig, job_id: str, transcript_text: str) -> str:
+def analyse(config: HermesConfig, job_id: str, text: str) -> str:
     """Error messages are fixed texts: nothing from the server, the key or the
     transcript is ever copied into them, because they are stored in the manifest."""
     url = check_endpoint(config.base_url)
     key = _api_key(config.api_key_env)
-    body = json.dumps(build_payload(config, job_id, transcript_text)).encode("utf-8")
+    body = json.dumps(build_payload(config, job_id, text)).encode("utf-8")
     request = urllib.request.Request(url, data=body, method="POST", headers={
         "Content-Type": "application/json", "Authorization": f"Bearer {key}"})
     try:
@@ -83,14 +77,8 @@ def analysis_handler(config: HermesConfig):
     def handle(context: StageContext) -> dict[str, Any]:
         if not config.enabled:
             raise StageSkipped("Hermes analysis is disabled in the configuration")
-        outputs = context.manifest.stage("transcription").outputs
-        text = "\n".join(s.text.strip() for s in load_segments(context.spool.root, outputs))
-        markdown = analyse(config, context.manifest.job_id, text)
-        name = f"{ANALYSIS_DIR}/{context.manifest.job_id}.md"
-        (context.spool.root / ANALYSIS_DIR).mkdir(parents=True, exist_ok=True)
-        atomic_write_text(context.spool.root / name, markdown.strip() + "\n")
-        return {"analysis_markdown": name, "model": config.model,
-                "payload_version": PAYLOAD_VERSION}
+        markdown = analyse(config, context.manifest.job_id, transcript_text(context))
+        return write_analysis(context, markdown, PROVIDER, config.model)
     return handle
 
 

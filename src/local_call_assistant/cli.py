@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from local_call_assistant.config import Config, config_path, load_config
+from local_call_assistant.integrations.claude_cli import claude_handler
 from local_call_assistant.integrations.hermes import analysis_handler
 from local_call_assistant.integrations.obsidian import note_handler
 from local_call_assistant.models import PROCESSABLE_STATUSES
@@ -19,9 +20,11 @@ from local_call_assistant.transcription import transcription_handler
 
 
 def build_pipeline(config: Config) -> Pipeline:
+    analysis = (claude_handler(config.claude) if config.claude.enabled
+                else analysis_handler(config.hermes))  # each skips when disabled
     handlers = {
         "transcription": transcription_handler(config.transcription),
-        "analysis": analysis_handler(config.hermes),
+        "analysis": analysis,
         "note": note_handler(config.obsidian),
     }
     return Pipeline(RecordingSpool(config.runtime_root), handlers, config.max_attempts)
