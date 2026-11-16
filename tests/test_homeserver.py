@@ -82,6 +82,31 @@ def test_remote_command_is_shell_quoted(fake_ssh: Path) -> None:
                       "--compute-type int8 --timeout 18 --language de"]
 
 
+def test_remote_values_are_quoted_even_if_validation_were_bypassed() -> None:
+    hostile = TranscriptionConfig(enabled=True, model="small", language="de;touch x")
+    remote = homeserver.build_command("ssh", _config(), hostile, "a" * 64)[-1]
+    assert remote.endswith("--language 'de;touch x'")
+
+
+def test_a_file_swapped_after_the_containment_check_is_not_sent(
+        spool: RecordingSpool, recorded: Manifest, fake_ssh: Path, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    other = tmp_path / "other.wav"
+    other.write_bytes(b"x")
+    audio_path, real_stat = spool.path_of(recorded), os.stat
+    monkeypatch.setattr(homeserver.os, "stat",
+                        lambda path, **kw: real_stat(other if path == audio_path else path, **kw))
+    with pytest.raises(HomeserverError, match="changed"):
+        transcribe_remote(_config(), TRANSCRIPTION, audio_path, recorded.sha256, _resolve)
+    assert not fake_ssh.exists()
+
+
+def test_ssh_batch_launchers_are_never_executed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(homeserver.shutil, "which", lambda name: r"C:\tools\ssh.CMD")
+    with pytest.raises(HomeserverError, match=r"\.cmd/\.bat launcher"):
+        homeserver.resolve_ssh("ssh")
+
+
 def test_server_deadline_is_below_the_client_timeout() -> None:
     assert homeserver.remote_timeout(_config(timeout_seconds=3600)) == 3540
     assert homeserver.remote_timeout(_config(timeout_seconds=20)) == 18
@@ -168,6 +193,24 @@ def test_symlinked_audio_is_refused(
     spool.save(Manifest.from_dict({**recorded.to_dict(), "audio_file": f"recordings/completed/{recorded.job_id}.flac"}))
     manifest = _pipeline(spool).process(recorded.job_id)
     assert manifest.stage("transcription").status is StageStatus.FAILED
+    assert not fake_ssh.exists()
+
+
+def test_symlink_to_another_jobs_audio_inside_the_spool_is_refused(
+        spool: RecordingSpool, recorded: Manifest, fake_ssh: Path) -> None:
+    other = spool.start(sample_rate=16_000, channels=1)
+    spool.append(other.job_id, b"\x00\x02" * 100)
+    other = spool.finalize(other.job_id)
+    link = spool.completed / f"{recorded.job_id}.flac"
+    try:
+        link.symlink_to(spool.path_of(other))
+    except OSError:
+        pytest.skip("creating symlinks needs extra rights on this system")
+    spool.save(Manifest.from_dict({**recorded.to_dict(), "sha256": other.sha256,
+                                   "audio_file": f"recordings/completed/{recorded.job_id}.flac"}))
+    manifest = _pipeline(spool).process(recorded.job_id)
+    stage = manifest.stage("transcription")
+    assert stage.status is StageStatus.FAILED and "not inside the spool" in stage.attempts[-1].error
     assert not fake_ssh.exists()
 
 
@@ -283,6 +326,16 @@ def test_server_audio_has_no_name_while_transcribing(server_cache: Path) -> None
     audio = b"RIFF audio"
     homeserver_server.serve(_server_args(audio), io.BytesIO(audio), RecordingBackend)
     assert RecordingBackend.seen["cache_entries"] == [homeserver_server.LOCK_NAME]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows temporary files keep a name until closed")
+def test_server_refuses_to_write_audio_into_a_named_file(
+        server_cache: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import tempfile
+    monkeypatch.setattr(homeserver_server.tempfile, "TemporaryFile",
+                        lambda dir: tempfile.NamedTemporaryFile(dir=dir))
+    audio = b"x"
+    assert homeserver_server.serve(_server_args(audio), io.BytesIO(audio), RecordingBackend) == (6, None)
 
 
 def test_server_refuses_different_audio(server_cache: Path) -> None:
